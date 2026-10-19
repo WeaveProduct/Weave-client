@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="desktopApp/icons/weavevpn-512.png" width="112" alt="WeaveVPN">
+  <img src="logo.png" width="112" alt="WeaveVPN">
 </p>
 
 <h1 align="center">WeaveVPN</h1>
@@ -54,4 +54,4 @@ WeaveVPN работает **только с подписками WeaveVPN**. П�
 Сайт — [weavevpn.ru](https://weavevpn.ru) · Бот — [@WeaveVPNBot](https://t.me/WeaveVPNBot) ·
 Поддержка — [@WeaveVPN_support](https://t.me/WeaveVPN_support)
 
-Сборка из исходников и устройство приложения — [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+В приложении используются компоненты с открытым исходным кодом — [список и лицензии](NOTICE.md).
