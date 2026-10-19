@@ -1,0 +1,218 @@
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 13f88e3..8f646db 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+-	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/debug"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -145,22 +144,9 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
+-			})
+-		}
+-	}
+-	err = uConn.BuildHandshakeState()
+-	if err != nil {
+-		return nil, err
+-	}
++	// WeaveVPN: X25519MLKEM768 is kept in the ClientHello, as the Xray client does.
++	// xtls/reality servers since Xray 26.9 reject hellos without it; older servers
++	// authenticate with the separate X25519 key share, so they keep working.
+ 
+ 	if len(uConfig.NextProtos) > 0 {
+ 		for _, extension := range uConn.Extensions {
+@@ -183,9 +169,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
+ 
+-	hello.SessionId[0] = 1
+-	hello.SessionId[1] = 8
+-	hello.SessionId[2] = 1
++	// WeaveVPN: report a current Xray version instead of 1.8.1, so that servers with
++	// realitySettings.minClientVer (set by many panels) accept the client.
++	hello.SessionId[0] = 26
++	hello.SessionId[1] = 9
++	hello.SessionId[2] = 9
+ 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+ 	copy(hello.SessionId[8:], e.shortID[:])
+ 	if debug.Enabled {
+@@ -200,6 +188,9 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 		return nil, E.New("nil KeyShareKeys")
+ 	}
+ 	ecdheKey := keyShareKeys.Ecdhe
++	if ecdheKey == nil {
++		ecdheKey = keyShareKeys.MlkemEcdhe
++	}
+ 	if ecdheKey == nil {
+ 		return nil, E.New("nil ecdheKey")
+ 	}
+diff --git a/common/trafficcontrol/manager.go b/common/trafficcontrol/manager.go
+index d5b6a2b..9b0b508 100644
+--- a/common/trafficcontrol/manager.go
++++ b/common/trafficcontrol/manager.go
+@@ -42,6 +42,8 @@ type Manager struct {
+ 	closedConnections       list.List[TrackerMetadata]
+ 	closedUploadTotal       int64
+ 	closedDownloadTotal     int64
++	// WeaveVPN: totals of connections dropped from closedConnections, by outbound type.
++	closedTypeTotals map[string][2]int64
+ 
+ 	eventSubscriber *observable.Subscriber[ConnectionEvent]
+ 	eventObserver   *observable.Observer[ConnectionEvent]
+@@ -110,6 +112,7 @@ func (m *Manager) leave(tracker Tracker) {
+ 		evicted := m.closedConnections.PopFront()
+ 		m.closedUploadTotal += evicted.Upload.Load()
+ 		m.closedDownloadTotal += evicted.Download.Load()
++		m.addClosedTypeTotal(evicted.OutboundType, evicted.Upload.Load(), evicted.Download.Load())
+ 	}
+ 	m.closedConnections.PushBack(metadataCopy)
+ 	m.closedConnectionsAccess.Unlock()
+@@ -187,6 +190,44 @@ func (m *Manager) Clear() {
+ 	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
+ 		m.closedUploadTotal += element.Value.Upload.Load()
+ 		m.closedDownloadTotal += element.Value.Download.Load()
++		m.addClosedTypeTotal(element.Value.OutboundType, element.Value.Upload.Load(), element.Value.Download.Load())
+ 	}
+ 	m.closedConnections.Init()
+ }
++
++// addClosedTypeTotal must be called with closedConnectionsAccess held.
++func (m *Manager) addClosedTypeTotal(outboundType string, upload int64, download int64) {
++	if m.closedTypeTotals == nil {
++		m.closedTypeTotals = make(map[string][2]int64)
++	}
++	total := m.closedTypeTotals[outboundType]
++	total[0] += upload
++	total[1] += download
++	m.closedTypeTotals[outboundType] = total
++}
++
++// TotalByOutboundType (WeaveVPN): upload/download since start by outbound type (direct, socks, vless, ...),
++// including closed connections, so clients can tell traffic through the server from direct traffic.
++func (m *Manager) TotalByOutboundType() map[string][2]int64 {
++	totals := make(map[string][2]int64)
++	add := func(outboundType string, upload int64, download int64) {
++		total := totals[outboundType]
++		total[0] += upload
++		total[1] += download
++		totals[outboundType] = total
++	}
++	m.closedConnectionsAccess.Lock()
++	for outboundType, total := range m.closedTypeTotals {
++		add(outboundType, total[0], total[1])
++	}
++	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
++		add(element.Value.OutboundType, element.Value.Upload.Load(), element.Value.Download.Load())
++	}
++	m.closedConnectionsAccess.Unlock()
++	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
++		metadata := tracker.Metadata()
++		add(metadata.OutboundType, metadata.Upload.Load(), metadata.Download.Load())
++		return true
++	})
++	return totals
++}
+diff --git a/experimental/clashapi/connections.go b/experimental/clashapi/connections.go
+index 2cf0a71..989c6e4 100644
+--- a/experimental/clashapi/connections.go
++++ b/experimental/clashapi/connections.go
+@@ -24,11 +24,24 @@ import (
+ func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Get("/", getConnections(ctx, trafficManager))
++	r.Get("/totals", getTotalsByOutboundType(trafficManager))
+ 	r.Delete("/", closeAllConnections(ctx, network, trafficManager))
+ 	r.Delete("/{id}", closeConnection(trafficManager))
+ 	return r
+ }
+ 
++// getTotalsByOutboundType (WeaveVPN): {"direct":{"up":1,"down":2},"socks":{...}} since start.
++func getTotalsByOutboundType(trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
++	return func(w http.ResponseWriter, r *http.Request) {
++		totals := trafficManager.TotalByOutboundType()
++		result := make(render.M, len(totals))
++		for outboundType, total := range totals {
++			result[outboundType] = render.M{"up": total[0], "down": total[1]}
++		}
++		render.JSON(w, r, result)
++	}
++}
++
+ func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
+ 	uplinkTotal, downlinkTotal := trafficManager.Total()
+ 	connections := common.Filter(trafficManager.Connections(), func(metadata *trafficcontrol.TrackerMetadata) bool {
+diff --git a/option/rule_action.go b/option/rule_action.go
+index ae05200..4691071 100644
+--- a/option/rule_action.go
++++ b/option/rule_action.go
+@@ -325,6 +325,8 @@ func (r *RejectActionOptions) UnmarshalJSON(bytes []byte) error {
+ type RouteActionSniff struct {
+ 	Sniffer badoption.Listable[string] `json:"sniffer,omitempty" enum:"tls,http,quic,dns,stun,bittorrent,dtls,ssh,rdp,ntp"`
+ 	Timeout badoption.Duration         `json:"timeout,omitempty"`
++	// WeaveVPN: destination becomes the sniffed domain (like Xray destOverride), public addresses only.
++	OverrideDestination bool `json:"override_destination,omitempty"`
+ }
+ 
+ type RouteActionResolve struct {
+diff --git a/route/route.go b/route/route.go
+index 62f1c86..c097dda 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -364,7 +364,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
+ 				continue
+ 			}
+ 			//goland:noinspection GoDeprecation
+-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
++			if action.OverrideDestination && M.IsDomainName(metadata.Domain) && N.IsPublicAddr(metadata.Destination.Addr) {
+ 				metadata.Destination = M.Socksaddr{
+ 					Fqdn: metadata.Domain,
+ 					Port: metadata.Destination.Port,
+@@ -751,7 +751,7 @@ func (r *Router) actionSniff(
+ 		metadata.SniffError = err
+ 		if err == nil {
+ 			//goland:noinspection GoDeprecation
+-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
++			if action.OverrideDestination && M.IsDomainName(metadata.Domain) && N.IsPublicAddr(metadata.Destination.Addr) {
+ 				metadata.Destination = M.Socksaddr{
+ 					Fqdn: metadata.Domain,
+ 					Port: metadata.Destination.Port,
+@@ -875,7 +875,7 @@ func (r *Router) actionSniff(
+ 	finally:
+ 		if err == nil {
+ 			//goland:noinspection GoDeprecation
+-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
++			if action.OverrideDestination && M.IsDomainName(metadata.Domain) && N.IsPublicAddr(metadata.Destination.Addr) {
+ 				metadata.Destination = M.Socksaddr{
+ 					Fqdn: metadata.Domain,
+ 					Port: metadata.Destination.Port,
+diff --git a/route/rule/rule_action.go b/route/rule/rule_action.go
+index cb65611..b5d6638 100644
+--- a/route/rule/rule_action.go
++++ b/route/rule/rule_action.go
+@@ -105,8 +105,9 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
+ 		return &RuleActionHijackDNS{}, nil
+ 	case C.RuleActionTypeSniff:
+ 		sniffAction := &RuleActionSniff{
+-			SnifferNames: action.SniffOptions.Sniffer,
+-			Timeout:      time.Duration(action.SniffOptions.Timeout),
++			SnifferNames:        action.SniffOptions.Sniffer,
++			Timeout:             time.Duration(action.SniffOptions.Timeout),
++			OverrideDestination: action.SniffOptions.OverrideDestination,
+ 		}
+ 		return sniffAction, sniffAction.build()
+ 	case C.RuleActionTypeResolve:
